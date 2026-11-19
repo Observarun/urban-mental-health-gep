@@ -2,7 +2,7 @@ name: observarun_GlobalInVESTdev
 channels:
   - conda-forge
 dependencies:
-  - python=3.10
+  - python=3.13.9
   - numpy
   - pandas
   - geopandas
@@ -17,6 +17,7 @@ dependencies:
   - pygeoprocessing
   - tqdm
   - openpyxl
-  - pip
-  - pip:
-      - hazelbean
+  - hazelbean
+  - os
+  - json
+  - pyproj
