@@ -1,17 +1,22 @@
 import os
+import json
 import rasterio
-from rasterstats import zonal_stats
+#from rasterstats import zonal_stats
 from rasterio.enums import Resampling
+from rasterio.windows import Window
+import rasterio.features
+import rasterio.windows
 import rasterio.warp
 import numpy as np
 from tqdm import tqdm
-import gc
+#import gc
 import pandas as pd
 import geopandas as gpd
-from osgeo import gdal
+from osgeo import gdal, ogr
+import pyproj
 import shapely
 from shapely.geometry import MultiPolygon
-import pygeoprocessing as pgp
+#import pygeoprocessing as pgp
 from hazelbean.spatial_utils import warp_raster_to_match
 import rioxarray
 import xarray as xr
@@ -42,7 +47,7 @@ def warp_raster_to_reference(
     #     match_path=reference_path,
     #     resample_method=resampling_method
     # )  # reconstructs output width & height from bounding_box/pixel_size
-        
+
     # Forcing the output width,height to exactly equal the reference raster's
     # own RasterXSize/RasterYSize (read directly from its header) rather than
     # reconstruction
@@ -157,7 +162,7 @@ def map_lulc_to_ndvi_dask(lulc_path, attr_table_path, ndvi_col, out_path, compre
 
     with rasterio.open(lulc_path) as src:
         src_nodata = src.nodata
-    
+
     # Setup Dask cluster.
     with LocalCluster(
         #n_workers=os.cpu_count()//4 or 1,
@@ -182,10 +187,9 @@ def map_lulc_to_ndvi_dask(lulc_path, attr_table_path, ndvi_col, out_path, compre
         def lookup(block):
             max_lookup_index = len(lookup_array) - 1
             
-            # This is the fast, C-optimized NumPy lookup
-            ndvi_arr = np.full(block.shape, np.nan, dtype=np.float32)
+            ndvi_arr = np.full(block.shape, np.nan, dtype=np.float32)  # fast, C-optimized NumPy lookup
             
-            if block.size > 0: 
+            if block.size > 0:
                 mask = (block <= max_lookup_index) & (block >= 0)
                 if src_nodata is not None:
                     mask = mask & (block != src_nodata)  # exclude the nodata value
@@ -196,7 +200,7 @@ def map_lulc_to_ndvi_dask(lulc_path, attr_table_path, ndvi_col, out_path, compre
 
         src_raster = rioxarray.open_rasterio(
             lulc_path, 
-            chunks={'x': 2048, 'y': 2048}, # Tell Dask how to chunk it
+            chunks={'x': 2048, 'y': 2048},  # tell Dask how to chunk
             lock=False
         )  # open_rasterio opens the GeoTIFF
             # and returns a Dask-backed XARRAY DataArray
@@ -350,14 +354,14 @@ def calculate_preventable_cases(
                 if pop_nodata is not None:
                     pop = np.where(pop == pop_nodata, np.nan, pop)  # mask WorldPop's NoData sentinel before it enters arithmetic
                 
-                # Calculate preventable fraction.
-                pf = 1 - np.power(risk_ratio, 10*delta_ne)
+                # calculate preventable fraction
+                pf = np.power(risk_ratio, -10*delta_ne) - 1
 
-                # Calculate baseline cases and preventable cases.
+                # calculate baseline cases and preventable cases
                 bc = prevalence * pop  # baseline cases per pixel
                 preventable_cases = bc * pf  # preventable cases per pixel
 
-                # Handle NaN values.
+                # handle NaN values
                 preventable_cases = np.where(np.isnan(delta_ne) | np.isnan(pop), np.nan, preventable_cases)
 
                 dst.write(preventable_cases.astype('float32'), 1, window=window)
@@ -365,61 +369,351 @@ def calculate_preventable_cases(
     #print(f"Preventable cases raster saved to: {out_path}")
 
 
-def aggregate_preventable_cases_by_region(
-        preventable_cases_raster_path,
-        urban_region_boundary_path,
-        out_csv_path
+def _file_stamp(path):
+    """
+    Identify a file by absolute path, size and modification time (cheap, no content hashing).
+    Used to decide whether a saved zone raster still matches the files it was built from.
+    """
+    st = os.stat(path)
+    return {'path': os.path.abspath(path), 'size': st.st_size, 'mtime_ns': st.st_mtime_ns}
+
+
+def _zones_vector_path(zone_raster_path):
+    """Path of the derived polygons-with-zone_id file that sits beside the zone raster."""
+    return os.path.splitext(zone_raster_path)[0] + '_zones.gpkg'
+
+
+def rasterize_regions_to_reference_grid(
+        region_boundary_path,
+        reference_path,
+        out_zone_raster_path,
+        out_lookup_csv_path,
+        all_touched=False,
+        compress="deflate"
         ):
     """
-    Aggregate preventable cases by urban regions using pygeoprocessing.
+    Rasterize the urban region polygons onto the reference (population) grid.
+
+    First half of the grid-based zonal statistics. Each pixel receives the integer
+    `zone_id` of the region whose polygon contains the pixel centre (0 = outside every region),
+    on exactly the reference raster's CRS, extent and resolution. Because the zones now live on
+    the same grid as the preventable-cases raster, no raster is ever reprojected. Polygons are
+    reprojected only if their CRS differs from the grid's (see below).
+
+    Design points:
+      * `zone_id` is a sequential 1..N integer assigned here, not the boundary file's own 'id'
+        column (which need not be unique or numeric). The mapping zone_id -> region attributes
+        is written to `out_lookup_csv_path`.
+      * If the boundary file's CRS differs from the reference raster's, the polygons are
+        reprojected to the raster's CRS in memory (geopandas `to_crs`) and the reprojected copy
+        is what gets burned, through the derived `_zones.gpkg`. The input boundary file itself is
+        never modified. A boundary file with no CRS defined raises an error.
+      * A pixel carries one zone_id. If polygons overlap, the later polygon in file order wins
+        for the shared pixels, so no pixel is counted in two regions. There is no priority
+        rule. (This function does not check whether the boundary file
+        contains overlaps.)
+      * `all_touched=False` (default): a pixel belongs to a region only if its centre falls
+        inside the polygon. (Using ALL_TOUCHED=True gives every polygon at least one pixel, but
+	every polygon also gains a ring of edge pixels.) Polygons that end up with no pixel centre
+	are handled by the tiny-polygon pass in `aggregate_preventable_cases_by_region`.
+      * The raster is written to a temporary name and renamed only when complete, and a
+        signature (boundary file, reference raster, all_touched) is saved beside it. An existing
+        raster is reused only if that signature still matches, so a changed boundary file or
+        population grid triggers a rebuild instead of silently reusing a stale raster.
     """
-    # Load urban boundaries to handle reprojection and attributes.
-    urban_boundaries = gpd.read_file(urban_region_boundary_path)
-    processing_boundary_path = urban_region_boundary_path
+    
+    # define file signature to track source dependencies
+    signature_path = out_zone_raster_path + '.signature.json'
+    signature = {
+        'boundary': _file_stamp(region_boundary_path),
+        'reference': _file_stamp(reference_path),
+        'all_touched': bool(all_touched),
+    }
 
-    with rasterio.open(preventable_cases_raster_path) as src:
-        raster_crs = src.crs
-        print(f"Raster CRS: {raster_crs}")
+    # check if zone raster already exists and matches signature
+    if os.path.exists(out_zone_raster_path):
+        reusable = False
+        if os.path.exists(out_lookup_csv_path) and os.path.exists(signature_path):
+            with open(signature_path) as fh:
+                reusable = json.load(fh) == signature
+        if reusable:
+            print(f"Zone raster already exists at {out_zone_raster_path} and matches its sources. "
+                  "Skipping rasterization.")
+            return out_zone_raster_path
+        print(f"Zone raster at {out_zone_raster_path} is missing its signature or no longer matches "
+              "its sources. Rebuilding.")
+    if os.path.exists(signature_path):
+        os.remove(signature_path)  # a rebuild in progress mustn't sit beside an old signature
 
-    # Reproject vector data and save to disk for pygeoprocessing.
-    if urban_boundaries.crs != raster_crs:
-        print(f"Reprojecting vector data from {urban_boundaries.crs} to match raster CRS {raster_crs}")
-        urban_boundaries = urban_boundaries.to_crs(raster_crs)
-        processing_boundary_path = out_csv_path.replace('.csv', '_reprojected.gpkg')
-        urban_boundaries.to_file(processing_boundary_path, driver="GPKG")
+    # load boundaries & check for defined CRS
+    with rasterio.open(reference_path) as ref:
+        ref_crs = ref.crs
+    boundaries = gpd.read_file(region_boundary_path)
+    if boundaries.crs is None or ref_crs is None:
+        raise ValueError("Both boundary file and reference raster need a defined CRS.")
+    
+    # reproject boundaries to reference crs in memory
+    if not boundaries.crs.equals(pyproj.CRS.from_user_input(ref_crs.to_wkt()), ignore_axis_order=True):
+        print(f"Boundary CRS ({boundaries.crs.to_string()}) differs from the reference raster CRS "
+              f"({ref_crs.to_string()}). Reprojecting the polygons in memory; the input file is not modified.")
+        boundaries = boundaries.to_crs(ref_crs.to_wkt())
 
-    # Calculate zonal statistics for all polygons at block-level.
-    print("Calculating zonal statistics using pygeoprocessing...")
-    zs = pgp.geoprocessing.zonal_statistics(
-        (preventable_cases_raster_path, 1),
-        processing_boundary_path
+    # filter for valid polygon geometries and number them 1 to N
+    n_read = len(boundaries)
+    boundaries = boundaries[
+        boundaries.geometry.notna() &
+        boundaries.geometry.geom_type.isin(['Polygon', 'MultiPolygon']) &
+        ~boundaries.geometry.is_empty
+    ].reset_index(drop=True)
+    if len(boundaries) < n_read:
+        print(f"Dropped {n_read - len(boundaries):,} null, empty or non-polygon geometries.")
+    boundaries['zone_id'] = np.arange(1, len(boundaries) + 1, dtype='int64')  # sequential zone IDs
+
+    # zone_id -> attributes lookup (columns are filled w/ None when boundary file lacks them)
+    lookup = pd.DataFrame({'zone_id': boundaries['zone_id'].values})
+    lookup['region_id'] = boundaries['id'].values if 'id' in boundaries.columns else lookup['zone_id']
+    for out_col, in_col in (('country', 'country'), ('iso3_r250_label', 'iso3'),
+                            ('region_name', 'region_name'), ('smod_level', 'smod_level'),
+                            ('area_km2', 'area_km2')):
+        lookup[out_col] = boundaries[in_col].values if in_col in boundaries.columns else None
+    lookup.to_csv(out_lookup_csv_path, index=False)
+
+    # export valid polygons with their zone_ids to vector file for GDAL burn (rasterization)
+    zones_vector_path = _zones_vector_path(out_zone_raster_path)
+    if os.path.exists(zones_vector_path):
+        os.remove(zones_vector_path)
+    boundaries[['zone_id', 'geometry']].to_file(zones_vector_path, driver='GPKG')
+
+    # Create zone raster on reference grid and burn zone_id into it.
+    partial_path = out_zone_raster_path + '.partial'
+    if os.path.exists(partial_path):
+        os.remove(partial_path)
+    ref_ds = gdal.Open(reference_path)
+    out_ds = gdal.GetDriverByName('GTiff').Create(
+        partial_path, ref_ds.RasterXSize, ref_ds.RasterYSize, 1, gdal.GDT_Int32,
+        options=['TILED=YES', 'BIGTIFF=YES', 'SPARSE_OK=TRUE', f'COMPRESS={compress.upper()}']
     )
+    if out_ds is None:
+        raise RuntimeError(f"Could not create zone raster at {partial_path}")
+    out_ds.SetGeoTransform(ref_ds.GetGeoTransform())
+    out_ds.SetProjection(ref_ds.GetProjection())
+    out_ds.GetRasterBand(1).SetNoDataValue(0)
+    ref_ds = None
 
-    results = []
+    # rasterize polygons onto the grid using zone_id
+    vector_ds = ogr.Open(zones_vector_path)
+    layer = vector_ds.GetLayer(0)
+    rasterize_options = ['ATTRIBUTE=zone_id'] + (['ALL_TOUCHED=TRUE'] if all_touched else [])
+    print(f"Rasterizing {len(boundaries):,} regions onto the reference grid...")
+    err = gdal.RasterizeLayer(out_ds, [1], layer, options=rasterize_options)
+    if err != 0:
+        raise RuntimeError(f"gdal.RasterizeLayer failed with error code {err}")
+    out_ds.FlushCache()
+    out_ds = None
+    vector_ds = None
+
+    # finalize raster and write signature file
+    os.replace(partial_path, out_zone_raster_path)
+    with open(signature_path, 'w') as fh:
+        json.dump(signature, fh, indent=2)  # written last; its presence implies everything above finished
+
+    print(f"Zone raster saved to: {out_zone_raster_path}")
+    print(f"Zone lookup saved to: {out_lookup_csv_path}")
+    return out_zone_raster_path
+
+
+def _rescue_unmatched_polygons(csrc, zsrc, zones_vector_path, unmatched_ids, sums, counts, window_size):
+    """
+    Tiny-polygon pass: give regions that own no pixel centre the free pixels they touch.
+
+    A region is "unmatched" when no pixel centre of the population grid falls inside its polygon
+    (typically a polygon smaller than one pixel, or a thin sliver). For each such region this
+    finds the pixels its outline touches and keeps those that are
+      * not owned by any region in the zone raster (zone_id == 0), so no pixel is ever counted
+        in two regions;
+      * not already given to another rescued region in this pass (first region wins);
+      * valid in the preventable-cases raster (not NaN).
+
+    Their cases are added to `sums` and `counts` in place. Only pixels the polygon actually
+    touches are used (not its whole bounding box), so a thin sliver does not collect its whole
+    bounding box.
+
+    Returns:
+        tuple: (number of unmatched regions that received at least one pixel,
+                total preventable cases added by this pass).
+    """
     
-    # Process results: pygeoprocessing returns a dict keyed by the vector's FID.
-    # Geopandas loads FIDs into the dataframe index sequentially (or 0-indexed).
-    urban_boundaries['fid'] = range(1, len(urban_boundaries) + 1)
+    # skip if grid is not north-up
+    transform = csrc.transform
+    if transform.b != 0 or transform.d != 0 or transform.a <= 0 or transform.e >= 0:
+        print("Tiny-polygon pass skipped: it assumes a north-up grid.")
+        return 0, 0.0
+
+    # load polygons for unmatched zone_ids
+    n_rows, n_cols = csrc.shape
+    zones = gpd.read_file(zones_vector_path)
+    zones = zones[zones['zone_id'].isin(unmatched_ids)]
+
+    claimed = set()  # flattened (row * n_cols + col) of pixels already given to a rescued region
+    n_rescued, rescued_cases = 0, 0.0
     
-    for fid, stats in tqdm(zs.items(), desc="Compiling zonal statistics"):
-        if stats['count'] == 0 or stats['count'] is None:
-            continue
+    # loop over each unmatched polygon to claim touched pixels
+    for zone_id, geom in zip(zones['zone_id'].values, zones.geometry.values):
+        # calculate pixel grid indices for polygon bounding box
+        xmin, ymin, xmax, ymax = geom.bounds
+        col0 = max(int(np.floor((xmin - transform.c) / transform.a)), 0)
+        col1 = min(int(np.ceil((xmax - transform.c) / transform.a)), n_cols)
+        row0 = max(int(np.floor((ymax - transform.f) / transform.e)), 0)
+        row1 = min(int(np.ceil((ymin - transform.f) / transform.e)), n_rows)
+        if col1 <= col0 or row1 <= row0:
+            continue  # entirely off the grid
 
-        # Retrieve original row data based on FID.
-        row = urban_boundaries[urban_boundaries['fid'] == fid].iloc[0]
+        # process touched pixels in chunks
+        for row in range(row0, row1, window_size):
+            for col in range(col0, col1, window_size):
+                window = Window(col, row, min(window_size, col1 - col), min(window_size, row1 - row))
+                
+                # identify all pixels touched by the polygon
+                touched = rasterio.features.rasterize(
+                    [(geom, 1)], out_shape=(window.height, window.width),
+                    transform=rasterio.windows.transform(window, transform),
+                    fill=0, all_touched=True, dtype='uint8'
+                ).astype(bool)
+                
+                # find touched pixels that are currently unassigned
+                free = touched & (zsrc.read(1, window=window) == 0)
+                if not free.any():
+                    continue
+                
+                # assign valid unassigned pixels to the current zone
+                cases = csrc.read(1, window=window)
+                rows, cols = np.nonzero(free & np.isfinite(cases))
+                for r, c in zip(rows.tolist(), cols.tolist()):
+                    key = (row + r) * n_cols + (col + c)
+                    if key in claimed:
+                        continue
+                    claimed.add(key)
+                    sums[zone_id] += float(cases[r, c])
+                    counts[zone_id] += 1
+                    rescued_cases += float(cases[r, c])
+        if counts[zone_id] > 0:
+            n_rescued += 1
 
-        region_stats = {
-            "region_id": row.get("id", fid),
-            "country": row.get("country", None),
-            "iso3_r250_label": row.get("iso3", None),
-            "total_preventable_cases": stats['sum'] if stats['sum'] is not None else 0
-        }
-        results.append(region_stats)
+    return n_rescued, rescued_cases
 
-    # Save to CSV.
-    df = pd.DataFrame(results)
-    if 'total_preventable_cases' in df.columns:
-        df['total_preventable_cases'] = df['total_preventable_cases'].round(0).astype(int)
+
+def aggregate_preventable_cases_by_region(
+        preventable_cases_raster_path,
+        zone_id_raster_path,
+        zone_lookup_csv_path,
+        out_csv_path,
+        window_size=4096,
+        rescue_tiny_polygons=True
+        ):
+    """
+    Aggregate preventable cases by urban region blockwise on the population grid.
+
+    This is the second half of grid-based zonal stats. The preventable-cases raster and
+    the zone raster from `rasterize_regions_to_reference_grid` share one grid, so both are read
+    in matching windows and the cases are summed per zone_id with np.bincount. No raster is
+    reprojected and there is no per-polygon masking.
+
+    Regions that own no pixel centre get none. We give a tiny-polygon pass (`rescue_tiny_polygons=True`
+    argument) in `_rescue_unmatched_polygons` using the pixels the polygon touches and only
+    pixels no other region owns. Set it to False to leave such regions out. The pass reads the
+    derived `_zones.gpkg` beside the zone raster.
+
+    Regions with no valid pixels are omitted.
+    """
+    
+    # initialize arrays for zone aggregation
+    lookup = pd.read_csv(zone_lookup_csv_path)
+    n_zones = int(lookup['zone_id'].max())
+    sums = np.zeros(n_zones + 1, dtype=np.float64)
+    counts = np.zeros(n_zones + 1, dtype=np.int64)
+    owned = np.zeros(n_zones + 1, dtype=bool)  # zone has >=1 pixel centre on the grid (valid or nodata)
+    n_rescued, rescued_cases = 0, 0.0
+
+    # verify rasters share the same shape, transform, and crs
+    with rasterio.open(preventable_cases_raster_path) as csrc, rasterio.open(zone_id_raster_path) as zsrc:
+        if csrc.shape != zsrc.shape:
+            raise ValueError(
+                f"Preventable-cases raster {csrc.shape} and zone raster {zsrc.shape} differ in shape; "
+                "rebuild the zone raster on the population grid."
+            )
+        if not np.allclose(tuple(csrc.transform)[:6], tuple(zsrc.transform)[:6], rtol=0, atol=1e-9):
+            raise ValueError("Preventable-cases raster and zone raster are not on the same grid (geotransforms differ).")
+        if csrc.crs != zsrc.crs:
+            raise ValueError("Preventable-cases raster and zone raster have different CRS.")
+
+        # define processing windows
+        n_rows, n_cols = csrc.shape
+        windows = [
+            Window(col, row, min(window_size, n_cols - col), min(window_size, n_rows - row))
+            for row in range(0, n_rows, window_size)
+            for col in range(0, n_cols, window_size)
+        ]
+
+        # aggregate preventable cases blockwise
+        for window in tqdm(windows, desc="Summing preventable cases by region"):
+            zones = zsrc.read(1, window=window)
+            in_zone = zones > 0
+            if not in_zone.any():
+                continue
+
+            # extract zone ids and cases for valid pixels
+            ids = zones[in_zone]
+            values = csrc.read(1, window=window)[in_zone]
+            finite = np.isfinite(values)  # NaN = nodata (no population or no NDVI)
+
+            # sum cases and count valid pixels per zone using np.bincount
+            uniq, inverse = np.unique(ids, return_inverse=True)
+            inverse = inverse.ravel()
+            if uniq[-1] > n_zones:
+                raise ValueError(
+                    f"Zone raster holds zone_id {int(uniq[-1])} but the lookup stops at {n_zones}; "
+                    "the zone raster and lookup are from different runs."
+                )
+            owned[uniq] = True
+            if finite.any():
+                sums[uniq] += np.bincount(inverse[finite], weights=values[finite].astype(np.float64),
+                                          minlength=uniq.size)
+                counts[uniq] += np.bincount(inverse[finite], minlength=uniq.size)
+
+        # identify and rescue regions with no pixel centers
+        unmatched = np.flatnonzero(~owned[1:]) + 1
+        print(f"{unmatched.size:,} regions contain no pixel centre of the population grid "
+              "(for example, polygons smaller than a pixel).")
+        if rescue_tiny_polygons and unmatched.size:
+            zones_vector_path = _zones_vector_path(zone_id_raster_path)
+            if os.path.exists(zones_vector_path):
+                n_rescued, rescued_cases = _rescue_unmatched_polygons(
+                    csrc, zsrc, zones_vector_path, unmatched, sums, counts, window_size)
+                print(f"Tiny-polygon pass: {n_rescued:,} of them received at least one free pixel they "
+                      f"touch (adding {rescued_cases:,.0f} preventable cases); "
+                      f"{unmatched.size - n_rescued:,} still have none (every pixel they touch is owned "
+                      "by another region, is nodata, or is off the grid).")
+            else:
+                print(f"Tiny-polygon pass skipped: {zones_vector_path} not found.")
+
+    # merge aggregated totals with region lookup attributes
+    present = np.flatnonzero(counts)
+    df = pd.DataFrame({
+        'zone_id': present,
+        'n_valid_pixels': counts[present],
+        'total_preventable_cases': sums[present],
+    })
+    df = df.merge(lookup, on='zone_id', how='left', validate='one_to_one')
+    df = df[['region_id', 'country', 'iso3_r250_label', 'region_name', 'smod_level', 'area_km2',
+             'n_valid_pixels', 'total_preventable_cases']]
+
+    print(f"{len(df):,} of {len(lookup):,} regions received at least one valid pixel; "
+          f"{len(lookup) - len(df):,} had none and are omitted.")
+    print(f"Regions with negative total preventable cases: {int((df['total_preventable_cases'] < 0).sum()):,}; "
+          f"total across regions: {df['total_preventable_cases'].sum():,.0f}")
+
+    # round totals and save to csv
+    df['total_preventable_cases'] = df['total_preventable_cases'].round(0).astype(int)
     df.to_csv(out_csv_path, index=False)
     print(f"Regional preventable cases summary written to: {out_csv_path}")
 
@@ -429,30 +723,82 @@ def aggregate_preventable_cases_by_region(
 def apply_country_costs(
         regional_cases_csv_path,
         health_cost_rate_path,
-        out_country_csv_path
+        out_country_csv_path,
+        iso3_col='iso3_r250_label',
+        cost_col='price_usd_2019'
         ):
     """
-    Apply country-specific cost rates to aggregated preventable cases.
+    Apply country-specific treatment costs (USD 2019 per case) to aggregated preventable cases.
+
+    Regional cases are summed to the country level and joined to the cost table on ISO3.
+    I use left join from the cases side, so every country that has preventable cases
+    stays in the output. Countries with no price get NaN (empty) cost_savings rather than
+    being dropped.
     """
 
-    # Read input data.
+    # read input data
     regional_df = pd.read_csv(regional_cases_csv_path)
-    cost_df = pd.read_excel(health_cost_rate_path)
+    cost_df = pd.read_csv(health_cost_rate_path)
 
-    # Filter regions by countries.
-    filtered = regional_df[regional_df['country'].isin(cost_df['country'])]
+    # check expected columns exist
+    for name, df, cols in (
+            ('regional cases', regional_df, [iso3_col, 'country', 'total_preventable_cases']),
+            ('treatment cost', cost_df, [iso3_col, cost_col])
+            ):
+        missing = [c for c in cols if c not in df.columns]
+        if missing:
+            raise KeyError(f"{name} table is missing column(s) {missing}. Found: {list(df.columns)}")
 
-    # Sum preventable cases for each country.
-    country_sums = filtered[['country', 'total_preventable_cases']].groupby('country').sum()
+    # Normalise ISO3 codes so that stray whitespace or case cannot break the join.
+    for df in (regional_df, cost_df):
+        df[iso3_col] = df[iso3_col].astype('string').str.strip().str.upper()
 
-    # Merge summed cases with per-patient costs.
-    merged = pd.merge(country_sums, cost_df, on='country')
+    if regional_df[iso3_col].isna().all():
+        raise ValueError(
+            f"No ISO3 codes found in '{iso3_col}' of {regional_cases_csv_path}. "
+            "Check that the urban boundaries file has an 'iso3' column."
+        )
 
-    # Calculate cost savings.
-    merged['cost_savings'] = merged['total_preventable_cases'] * merged['cost_per_case']
+    # cost table must have exactly one price per ISO3, else the merge duplicates cases
+    cost_df = cost_df.dropna(subset=[iso3_col])
+    duplicated = cost_df.loc[cost_df[iso3_col].duplicated(keep=False), iso3_col].unique().tolist()
+    if duplicated:
+        raise ValueError(f"Treatment cost table has multiple rows for ISO3 code(s): {duplicated}")
 
-    # Write output CSV with desired columns.
-    merged[['country', 'total_preventable_cases', 'cost_savings']].to_csv(out_country_csv_path, index=False, float_format='%.2f')
+    # sum preventable cases for each country (keyed on ISO3)
+    has_iso3 = regional_df[iso3_col].notna()
+    country_sums = regional_df[has_iso3].groupby(iso3_col, as_index=False).agg(
+        country=('country', 'first'),
+        total_preventable_cases=('total_preventable_cases', 'sum')
+    )
+
+    # Regions with no ISO3 code are kept (grouped by country name) instead of silently dropped.
+    if (~has_iso3).any():
+        print(f"WARNING: {int((~has_iso3).sum())} region(s) have no ISO3 code; keeping them with no cost.")
+        no_iso3_sums = regional_df[~has_iso3].groupby('country', dropna=False, as_index=False).agg(
+            total_preventable_cases=('total_preventable_cases', 'sum')
+        )
+        no_iso3_sums[iso3_col] = pd.NA
+        country_sums = pd.concat([country_sums, no_iso3_sums], ignore_index=True)
+
+    # left-join the per-case cost on ISO3 so that no country is dropped
+    merged = country_sums.merge(
+        cost_df[[iso3_col, cost_col]].rename(columns={cost_col: 'cost_per_case'}),
+        on=iso3_col,
+        how='left',
+        validate='many_to_one'
+    )
+
+    # report countries that have preventable cases but no price
+    no_price = merged.loc[merged['cost_per_case'].isna(), iso3_col].fillna('<missing ISO3>').tolist()
+    print(f"Cost matched for {len(merged) - len(no_price)} of {len(merged)} countries; "
+          f"{len(no_price)} without a price (cost_savings left empty).")
+
+    merged['cost_savings'] = merged['total_preventable_cases'] * merged['cost_per_case']  # cost savings (NaN where no price is available)
+
+    merged[['country', iso3_col, 'total_preventable_cases', 'cost_savings']].to_csv(
+        out_country_csv_path, index=False, float_format='%.2f'
+    )  # output CSV with desired columns
     print(f"Country-level cost savings saved to: {out_country_csv_path}")
 
     return out_country_csv_path

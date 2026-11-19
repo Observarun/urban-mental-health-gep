@@ -9,7 +9,7 @@ def task_warp_lulc_to_population(p):
     #Downsample ESA CCI LULC 300m data to match WorldPop 1km grid.
     Downsample ESA CCI LULC 30m data to match WorldPop 100m grid.
     """
-    
+
     #print(f"Reference reprojected population raster path for input: {p.population_2019_path}")
     p.lulc_reprojected_and_resampled_baseline_path = os.path.join(p.project_dir, "lulc_2019_reprojected_and_resampled.tif")
 
@@ -63,7 +63,7 @@ def task_create_no_vegetation_scenario(p):
         #compress="lzw"
         compress="deflate"
     )
-    
+
     print(f"No-vegetation NDVI scenario saved to {p.ndvi_no_vegetation_path}")
     return p.ndvi_no_vegetation_path
 
@@ -76,18 +76,17 @@ def task_calculate_delta_nature_exposure(p):
     p.ndvi_baseline_path = os.path.join(p.project_dir, 'ndvi_2019.tif')
     p.ndvi_no_vegetation_path = os.path.join(p.project_dir, 'ndvi_no_vegetation.tif')
     p.delta_ne_path = os.path.join(p.project_dir, 'delta_ne_2019_vs_no_veg.tif')
-    
+
     urban_mental_health_functions.calculate_delta_raster(
         raster1_path=p.ndvi_baseline_path,
         raster2_path=p.ndvi_no_vegetation_path,
-        #raster2_path=p.ndvi_baseline_path,
         out_path=p.delta_ne_path,
         operation=lambda a, b: a - b,  # NDVI_2019 - NDVI_no_vegetation
         fill_value=np.nan,
         #compress="lzw"
         compress="deflate"
     )
-    
+
     print(f"Delta NDVI raster (current vs no-vegetation) saved to {p.delta_ne_path}")
     return p.delta_ne_path
 
@@ -117,19 +116,50 @@ def task_calculate_preventable_cases(p):
     return p.preventable_cases_path
 
 
+def task_rasterize_regions_to_population_grid(p):
+    """
+    Task to rasterize the urban region polygons onto the population grid.
+
+    Each pixel gets the zone_id of the region containing its centre (0 = outside all regions),
+    on the population raster's own CRS, extent and resolution. The aggregation task then sums
+    preventable cases per zone_id on this shared grid, so neither the polygons nor any raster
+    needs reprojecting. Also writes the zone_id -> region attributes lookup.
+    """
+
+    p.region_zone_raster_path = os.path.join(p.project_dir, 'region_zone_ids.tif')
+    p.region_zone_lookup_csv = os.path.join(p.project_dir, 'region_zone_lookup.csv')
+
+    urban_mental_health_functions.rasterize_regions_to_reference_grid(
+        region_boundary_path=p.boundary_path,
+        reference_path=p.population_2019_path,
+        out_zone_raster_path=p.region_zone_raster_path,
+        out_lookup_csv_path=p.region_zone_lookup_csv,
+        all_touched=False,  # pixel belongs to a region only if its centre is inside the polygon
+        compress="deflate"
+    )
+    print(f"Region zone raster saved to {p.region_zone_raster_path}")
+
+    return p.region_zone_raster_path
+
+
 def task_aggregate_preventable_cases_by_region(p):
     """
     Task to aggregate preventable cases by urban regions.
+    Blockwise sum per zone_id on the population grid (no reprojection, no per-polygon masking).
     """
 
     #p.preventable_cases_path = p.get_path(os.path.join(p.project_dir, 'preventable_cases_2019.tif'))
     p.preventable_cases_path = os.path.join(p.project_dir, 'preventable_cases_2019.tif')
+    p.region_zone_raster_path = os.path.join(p.project_dir, 'region_zone_ids.tif')
+    p.region_zone_lookup_csv = os.path.join(p.project_dir, 'region_zone_lookup.csv')
     p.preventable_cases_by_region_csv = os.path.join(p.project_dir, 'preventable_cases_by_region.csv')
 
     result = urban_mental_health_functions.aggregate_preventable_cases_by_region(
         preventable_cases_raster_path=p.preventable_cases_path,
-        urban_region_boundary_path=p.urban_boundary_path,
-        out_csv_path=p.preventable_cases_by_region_csv
+        zone_id_raster_path=p.region_zone_raster_path,
+        zone_lookup_csv_path=p.region_zone_lookup_csv,
+        out_csv_path=p.preventable_cases_by_region_csv,
+        rescue_tiny_polygons=True  # regions smaller than a pixel get the free pixels they touch
     )
 
     # Return CSV path

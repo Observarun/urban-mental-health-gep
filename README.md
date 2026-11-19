@@ -17,9 +17,9 @@ and aggregates results by urban region and country.
    sub-pixel regions get the free pixels they touch).
 8. Apply country-specific cost per case (USD 2019) for avoided cost estimates.
 
-## Data (not tracked in this repo — see `.gitignore`)
+## Data
 - WorldPop 100m population raster.
 - GLC_FCS30D land-cover raster + `glc_fcs30d_attribute_table_processed.csv`.
-- Urban boundaries: GUPPD levels 30/23/22 + GHS-SMOD classes 21 and 13, built using preprocessing/guppd.ipynb.
+- Urban boundaries: GUPPD levels 30/23/22 + GHS-SMOD classes 21 and 13, built using preprocessing/guppd.ipynb .
 - `effect_size.xlsx` (depression odd ratio, Liu et al. 2023).
-- Country-level treatment cost table.
+- Country-level price table built using benefit_transfer/price_transfer_depression_hypertension.R .
